@@ -19,10 +19,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 def explore_d2e(d2e_dir: Path, max_show: int = 30):
