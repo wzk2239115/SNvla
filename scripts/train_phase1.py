@@ -76,12 +76,16 @@ def run_phase1(args):
 
     manifest_path = output_dir / "manifest.json"
 
-    # Create a temp dir with symlinks if filtering games
-    if args.games:
-        import tempfile, os
+    # If filtering to specific games, build from each game dir directly.
+    # For a single game, use its directory as root.
+    # For multiple games, build separate manifests and merge.
+    if args.games and len(games) == 1:
+        data_root = games[0]
+    elif args.games:
+        import tempfile, os, shutil
         tmp_dir = Path(tempfile.mkdtemp())
         for g in games:
-            (tmp_dir / g.name).symlink_to(g.resolve())
+            os.symlink(g.resolve(), tmp_dir / g.name)
         data_root = tmp_dir
     else:
         data_root = d2e_dir
