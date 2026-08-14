@@ -98,7 +98,8 @@ def train(args):
     n_total = sum(p.numel() for p in model.parameters())
     print(f"Trainable params: {n_trainable:,} / {n_total:,}")
 
-    # === Optimizer ===    optimizer = torch.optim.AdamW(
+    # === Optimizer ===
+    optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=args.lr,
         weight_decay=args.weight_decay,
