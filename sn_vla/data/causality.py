@@ -40,7 +40,31 @@ def has_b_frames(video_path: str | Path) -> bool:
 
     B-frames use bidirectional prediction and would violate causality for
     codec-native bit-cost readiness.
+
+    Fast path: reads the stream-level `has_b_frames` flag (instant).
+    Slow path (only if flag is ambiguous): full per-frame scan.
     """
+    # Fast path: stream metadata
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "quiet",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=has_b_frames",
+            "-of", "json",
+            str(video_path),
+        ],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode == 0:
+        streams = json.loads(result.stdout).get("streams", [])
+        if streams:
+            has_b = int(streams[0].get("has_b_frames", 0))
+            if has_b == 0:
+                return False  # definitive: no B-frames
+            # has_b_frames > 0 means the codec *supports*/declares them;
+            # fall through to verify actual frame types.
+
+    # Slow path: check actual pict_types
     frames = ffprobe_frames(video_path)
     pict_types = {f.get("pict_type", "?") for f in frames}
     return "B" in pict_types
