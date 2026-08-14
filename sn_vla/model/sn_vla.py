@@ -147,14 +147,21 @@ class SNVLA(nn.Module):
             gate_logits: [B, 2] or None (if gate disabled).
         """
         # 1. Visual encoding → [B, P, d_vision]
-        vis_feat = self.visual(visual, canvas_mask) if isinstance(self.visual, SimpleViT) \
-            else self.visual(visual)
+        #    Both SimpleViT and MageViTBackbone accept (canvases, canvas_mask)
+        vis_feat = self.visual(visual, canvas_mask)
+
+        # Expand canvas_mask [B, N] to patch_mask [B, P] for temporal memory
+        patch_mask = None
+        if canvas_mask is not None:
+            B, N_canv, C, H, W = visual.shape
+            patches_per_canvas = (H // 16) * (W // 16)
+            patch_mask = canvas_mask.unsqueeze(-1).repeat(1, 1, patches_per_canvas).reshape(B, -1)
 
         # 2. Temporal memory → h_t [B, d_fast]
         h_t = self.memory(
             vis_feat,
             prev_kbd, prev_mdx_bucket, prev_mdy_bucket, prev_btn, prev_wheel,
-            canvas_mask=canvas_mask,
+            canvas_mask=patch_mask,
         )
 
         # 3. Intention conditioning (Phase 3+)

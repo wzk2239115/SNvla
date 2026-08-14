@@ -97,38 +97,70 @@ class D2EDataset(Dataset):
     def __len__(self) -> int:
         return len(self._samples)
 
-    def _load_clip_visual(self, episode_id: str, clip_idx: int) -> np.ndarray:
-        """Load codec canvas images for a clip. Returns [n_canvas, H, W, 3] uint8."""
-        if self.codec_cache_dir is None:
-            return np.zeros((1, 224, 224, 3), dtype=np.uint8)
+    def _load_clip_visual(self, episode_id: str, clip_idx: int, tick: int) -> np.ndarray:
+        """Load visual input for a clip/tick. Returns [n_frames, H, W, 3] uint8.
 
-        clip_dir = self.codec_cache_dir / episode_id / f"clip_{clip_idx:05d}"
-        meta_path = clip_dir / "meta.json"
-        if not meta_path.exists():
-            return np.zeros((1, 224, 224, 3), dtype=np.uint8)
+        Priority:
+          1. Pre-computed codec canvas cache (if codec_cache_dir set)
+          2. On-the-fly frame extraction from mkv (fallback, no codec needed)
+        """
+        # Try codec cache first
+        if self.codec_cache_dir is not None:
+            clip_dir = self.codec_cache_dir / episode_id / f"clip_{clip_idx:05d}"
+            meta_path = clip_dir / "meta.json"
+            if meta_path.exists():
+                import cv2
+                meta = json.loads(meta_path.read_text())
+                canvases = []
+                for fname in meta.get("canvas_files", []):
+                    path = clip_dir / fname
+                    if path.suffix == ".npy":
+                        canvases.append(np.load(path))
+                    elif path.exists():
+                        img = cv2.imread(str(path))
+                        if img is not None:
+                            canvases.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                if canvases:
+                    return np.stack(canvases)
 
-        meta = json.loads(meta_path.read_text())
+        # Fallback: on-the-fly frame extraction from mkv
+        return self._extract_frames_onthefly(tick)
+
+    def _extract_frames_onthefly(self, tick: int, target_size: int = 224) -> np.ndarray:
+        """Extract a window of frames from the mkv at the given tick.
+
+        Samples n_sample_frames evenly within the visual window and resizes
+        to target_size × target_size.
+        """
         import cv2
-        canvases = []
-        for fname in meta.get("canvas_files", []):
-            path = clip_dir / fname
-            if path.suffix == ".npy":
-                canvases.append(np.load(path))
-            elif path.exists():
-                img = cv2.imread(str(path))
-                if img is not None:
-                    canvases.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        if not canvases:
-            # Fallback: load frames
-            frames_dir = clip_dir / "frames"
-            if frames_dir.exists():
-                for fp in sorted(frames_dir.glob("frame_*.png"))[:8]:
-                    img = cv2.imread(str(fp))
-                    if img is not None:
-                        canvases.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        if not canvases:
-            return np.zeros((1, 224, 224, 3), dtype=np.uint8)
-        return np.stack(canvases)
+        ep_idx = self._samples[tick][0] if tick < len(self._samples) else 0
+        idx = self._episode_indices[ep_idx]
+
+        end_frame = int(idx.visual_end_frame_idx[tick])
+        if end_frame < 0:
+            return np.zeros((1, target_size, target_size, 3), dtype=np.uint8)
+
+        start_frame = max(0, end_frame - self.window_frames + 1)
+        n_sample = min(8, end_frame - start_frame + 1)  # sample 8 frames
+        if n_sample <= 0:
+            return np.zeros((1, target_size, target_size, 3), dtype=np.uint8)
+
+        frame_indices = np.linspace(start_frame, end_frame, n_sample, dtype=int)
+
+        cap = cv2.VideoCapture(idx.mkv_path)
+        frames = []
+        for fi in frame_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ok, frame = cap.read()
+            if ok:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, (target_size, target_size))
+                frames.append(frame)
+        cap.release()
+
+        if not frames:
+            return np.zeros((1, target_size, target_size, 3), dtype=np.uint8)
+        return np.stack(frames)
 
     def _get_target(self, ep_idx: int, tick: int) -> SampleTarget:
         idx = self._episode_indices[ep_idx]
@@ -152,7 +184,7 @@ class D2EDataset(Dataset):
         idx = self._episode_indices[ep_arr_idx]
         episode_id = idx.episode_id
 
-        visual = self._load_clip_visual(episode_id, clip_idx)
+        visual = self._load_clip_visual(episode_id, clip_idx, tick)
         if self.transform:
             visual = self.transform(visual)
 
