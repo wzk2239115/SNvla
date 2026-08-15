@@ -93,7 +93,7 @@ def build_frame_cache(
 
     print(f"Building frame cache: {len(pairs)} episodes, stride={stride}, size={size}, workers={workers}")
 
-    jobs = [(mkv, cache_root, stride, size, quality) for mkv, _ in pairs]
+    jobs = [(mkv, cache_root, stride, size, quality) for _, mkv in pairs]
     done = skip = error = 0
     with ProcessPoolExecutor(max_workers=workers) as ex:
         for name, status in ex.map(_worker, jobs):
