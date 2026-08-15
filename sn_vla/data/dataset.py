@@ -97,7 +97,7 @@ class D2EDataset(Dataset):
     def __len__(self) -> int:
         return len(self._samples)
 
-    def _load_clip_visual(self, episode_id: str, clip_idx: int, tick: int) -> np.ndarray:
+    def _load_clip_visual(self, ep_arr_idx: int, episode_id: str, clip_idx: int, tick: int) -> np.ndarray:
         """Load visual input for a clip/tick. Returns [n_frames, H, W, 3] uint8.
 
         Priority:
@@ -124,18 +124,19 @@ class D2EDataset(Dataset):
                     return np.stack(canvases)
 
         # Fallback: on-the-fly frame extraction from mkv
-        return self._extract_frames_onthefly(tick)
+        return self._extract_frames_onthefly(ep_arr_idx, tick)
 
-    def _extract_frames_onthefly(self, tick: int, target_size: int = 224) -> np.ndarray:
+    def _extract_frames_onthefly(self, ep_arr_idx: int, tick: int, target_size: int = 224) -> np.ndarray:
         """Extract a window of frames from the mkv at the given tick.
 
         Samples n_sample_frames evenly within the visual window and resizes
         to target_size × target_size.
         """
         import cv2
-        ep_idx = self._samples[tick][0] if tick < len(self._samples) else 0
-        idx = self._episode_indices[ep_idx]
+        idx = self._episode_indices[ep_arr_idx]
 
+        if tick >= idx.n_ticks:
+            return np.zeros((1, target_size, target_size, 3), dtype=np.uint8)
         end_frame = int(idx.visual_end_frame_idx[tick])
         if end_frame < 0:
             return np.zeros((1, target_size, target_size, 3), dtype=np.uint8)
@@ -184,7 +185,7 @@ class D2EDataset(Dataset):
         idx = self._episode_indices[ep_arr_idx]
         episode_id = idx.episode_id
 
-        visual = self._load_clip_visual(episode_id, clip_idx, tick)
+        visual = self._load_clip_visual(ep_arr_idx, episode_id, clip_idx, tick)
         if self.transform:
             visual = self.transform(visual)
 
