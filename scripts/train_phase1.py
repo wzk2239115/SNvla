@@ -46,11 +46,13 @@ def setup_ddp():
     return 0, 0, 1, device
 
 
-def barrier(world_size):
+def barrier(world_size, timeout_s: int = 1800):
     if world_size > 1:
+        import datetime
         import torch
         import torch.distributed as dist
-        dist.barrier(device_ids=[torch.cuda.current_device()])
+        dist.barrier(device_ids=[torch.cuda.current_device()],
+                     timeout=datetime.timedelta(seconds=timeout_s))
 
 
 def explore_d2e(d2e_dir: Path, max_show: int = 40):
@@ -75,6 +77,7 @@ def run_phase1(args):
         output_dir.mkdir(parents=True, exist_ok=True)
 
     # === 1. Manifest (rank 0 builds, others wait) ===
+    manifest_path = output_dir / "manifest.json"
     if is_main:
         print(f"\n{'='*60}\nBuilding manifest...\n{'='*60}")
         from sn_vla.data.manifest import build_manifest
@@ -86,7 +89,6 @@ def run_phase1(args):
         if not games:
             sys.exit(1)
 
-        manifest_path = output_dir / "manifest.json"
         if args.games and len(games) == 1:
             data_root = games[0]
         else:
@@ -105,9 +107,10 @@ def run_phase1(args):
             sys.exit(1)
         print(f"\nManifest: {manifest['n_episodes']} episodes, {manifest['n_samples']:,} samples")
 
-    barrier(world_size)
+    barrier(world_size, timeout_s=7200)
 
-    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"manifest missing at {manifest_path} (rank {rank})")
 
     # === 2. Data ===
     from sn_vla.data.dataset import D2EDataset, collate_fn
