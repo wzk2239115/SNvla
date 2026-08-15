@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
-"""Data augmentation pipeline: video captions + action rationales.
+"""Data augmentation pipeline v2: split describe / explain across two models.
 
-Stage A (visual): Mage-VL watches clip frames (from JPEG cache) → scene description.
-Stage B (text):   same model, text-only, combines description + ground-truth
-                  action facts → intention label + rationale + consistency check.
+Stage A (Mage-VL, visual):    clip frames → OPERATIONAL description
+                              (what moves, where, UI changes — no motivation)
+Stage B (strong LLM, text):   description + ground-truth facts
+                              → INTENTION + RATIONALE ("why")
 
-Anti-hallucination guards:
-  - Facts are deterministic (event-stream reconstruction), never LLM-invented.
-  - Rationale prompt forbids introducing entities absent from the description.
-  - Post-hoc entity-overlap check; failing samples are flagged low-confidence.
+The strong LLM is queried via OpenAI-compatible API (vLLM / any provider):
+    --api-base http://localhost:8000/v1 --api-model Qwen3-32B
 
-Output: JSONL, one line per segment:
-  {episode_id, game, t_start_s, t_end_s, frame_ref, description, facts,
-   intention, rationale, consistency_ok, entity_overlap}
-
-Launch 4 workers (one per GPU) on the 4xH100 machine:
-  for i in 0 1 2 3; do
+Launch pattern (4xH100 machine):
+  # terminal 1: vLLM serving the strong LLM (2 or 3 GPUs)
+  vllm serve Qwen/Qwen3-32B --tensor-parallel-size 2 --port 8000
+  # terminal 2+: sharded describe jobs on remaining GPUs
+  for i in 1 2; do
     CUDA_VISIBLE_DEVICES=$i python scripts/augment_rationale.py \
-        --d2e-dir ... --magevl-dir ... --frame-cache ... \
-        --shard $i --num-shards 4 \
-        --output probes/aug_shard$i.jsonl &
-  done; wait
+        --stage describe --shard $i --num-shards 2 ... &
+  done
+  # then one process for the explain stage (API-bound, no GPU)
+  python scripts/augment_rationale.py --stage explain ...
 """
 
 from __future__ import annotations
@@ -28,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -95,30 +94,27 @@ def actions_to_facts(actions, start_tick: int, n_ticks: int) -> str:
 
 def select_segments(actions, seg_ticks: int, stride_ticks: int,
                     n_peaks: int) -> list[int]:
-    """Mix of uniform coverage + activity peaks. Returns start ticks, sorted."""
     n = len(actions)
     starts = list(range(0, max(0, n - seg_ticks), stride_ticks))
-    # Activity peaks
     scores = np.array([
         len(a.kbd_held) + abs(a.mouse_dx) / 20.0 + abs(a.mouse_dy) / 20.0
         for a in actions
     ])
     smooth = np.convolve(scores, np.ones(seg_ticks) / seg_ticks, mode="valid")
-    for idx in np.argsort(smooth)[::-1][: n_peaks * 3]:
+    added = 0
+    for idx in np.argsort(smooth)[::-1]:
         idx = int(idx)
         if all(abs(idx - s) >= seg_ticks for s in starts):
             starts.append(idx)
-        if len(starts) >= len(range(0, n, stride_ticks)) + n_peaks:
+            added += 1
+        if added >= n_peaks:
             break
     return sorted(set(s for s in starts if 0 <= s < n - seg_ticks))
 
 
-def entity_overlap_check(description: str, rationale: str, facts: str = "") -> bool:
-    """Cheap guard: nouns in rationale that appear nowhere in description/facts.
+# ---------------------------------------------------------- hallucination guards
 
-    Uses a small stopword list; flags samples with many novel entities.
-    """
-    import re
+def entity_overlap_check(description: str, rationale: str, facts: str = "") -> bool:
     stop = {"the", "a", "an", "is", "are", "was", "to", "of", "in", "on",
             "and", "or", "for", "with", "that", "this", "it", "its", "as",
             "be", "by", "at", "from", "he", "she", "they", "player", "game",
@@ -126,10 +122,11 @@ def entity_overlap_check(description: str, rationale: str, facts: str = "") -> b
             "press", "pressing", "presses", "release", "releasing",
             "holding", "held", "key", "keys", "mouse", "keyboard", "aim",
             "aiming", "attack", "attacking", "navigate", "navigating",
-            "using", "use", "using", "control", "character", "movement"}
+            "using", "use", "control", "character", "movement", "because",
+            "likely", "probably", "order", "trying", "would", "could"}
     words = lambda s: set(w for w in re.findall(r"[a-z]{3,}", s.lower()) if w not in stop)
     novel = words(rationale) - words(description) - words(facts)
-    return len(novel) <= 4  # allow a few generic verbs/nouns
+    return len(novel) <= 4
 
 
 ACTION_VERBS = {
@@ -143,18 +140,7 @@ ACTION_VERBS = {
 
 
 def key_hallucination_check(rationale: str, facts: str) -> bool:
-    """Detect fabricated input actions in rationale.
-
-    Two patterns:
-    1. Named keys not in ground truth (mentions 'R key' but no R in facts).
-    2. Action-verb + 'key' phrasing ('pressing the attack key') where the
-       facts contain none of the keys commonly bound to that action AND the
-       game inputs are pure movement (WASD-only) — a strong hallucination sign.
-    """
-    import re
     rl = rationale.lower()
-
-    # --- Pattern 1: named single-letter/space keys absent from facts ---
     gt_keys = set()
     for m in re.finditer(r"\b([A-Z]{1,10})\(", facts):
         gt_keys.add(m.group(1).lower())
@@ -162,13 +148,9 @@ def key_hallucination_check(rationale: str, facts: str) -> bool:
         gt_keys.update(k.strip().lower() for k in m.group(1).split(",") if k.strip())
     for m in re.finditer(r"Releases: ([^\n]+)", facts):
         gt_keys.update(k.strip().lower() for k in m.group(1).split(",") if k.strip())
-    if "space" in rl and "space" not in gt_keys and "space" in facts.lower() is False:
-        pass  # 'space' as word is ambiguous; handled by pattern 2
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".lower():
+    for letter in "abcdefghijklmnopqrstuvwxyz":
         if re.search(rf"\b{letter}\s+key\b", rl) and letter not in gt_keys:
             return True
-
-    # --- Pattern 2: '<action> key' with no plausible binding in facts ---
     facts_lower = facts.lower()
     clicks_present = "buttons held" in facts_lower and "buttons held 0" not in facts_lower
     for verb, bindings in ACTION_VERBS.items():
@@ -181,60 +163,38 @@ def key_hallucination_check(rationale: str, facts: str) -> bool:
     return False
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--d2e-dir", required=True)
-    ap.add_argument("--magevl-dir", required=True)
-    ap.add_argument("--frame-cache", required=True)
-    ap.add_argument("--games", default=None, help="Comma-separated filter")
-    ap.add_argument("--segment-frames", type=int, default=32,
-                    help="cache frames per segment (32×8=256 ticks ≈ 4.3s)")
-    ap.add_argument("--stride-seconds", type=float, default=60.0,
-                    help="uniform sampling period; peaks added on top")
-    ap.add_argument("--peaks-per-episode", type=int, default=6)
-    ap.add_argument("--max-segments", type=int, default=0, help="0 = all")
-    ap.add_argument("--max-episodes", type=int, default=0)
-    ap.add_argument("--shard", type=int, default=0)
-    ap.add_argument("--num-shards", type=int, default=1)
-    ap.add_argument("--output", required=True)
-    args = ap.parse_args()
+# ---------------------------------------------------------- describe stage
+
+DESC_PROMPT = (
+    "Watch this gameplay clip and describe ONLY what is observably happening, "
+    "in 2-4 sentences. Focus on OPERATIONS, not motivation:\n"
+    "- What the player-character does: movement direction, speed, actions "
+    "(running, shooting, jumping, interacting)\n"
+    "- Camera/view changes (turning, aiming, zooming)\n"
+    "- UI state and changes (menus, inventory, health bar, scores, timers)\n"
+    "- Which of these are visibly controlled by the player vs automatic\n"
+    "Do NOT guess reasons or strategy. Do NOT mention specific keyboard keys "
+    "(you cannot see them). Just describe visible behavior."
+)
+
+
+def run_describe(args):
+    """Stage A: Mage-VL → operational descriptions. Output: describe.jsonl"""
+    import torch
+    import cv2
+    from transformers import AutoModelForCausalLM, AutoProcessor
 
     CACHE_STRIDE = 8
     seg_ticks = args.segment_frames * CACHE_STRIDE
     stride_ticks = int(args.stride_seconds * 60)
 
-    # === Model (one per process) ===
-    print(f"[shard {args.shard}] loading Mage-VL...", flush=True)
-    import torch
-    from transformers import AutoModelForCausalLM, AutoProcessor
-
+    print(f"[describe shard {args.shard}/{args.num_shards}] loading Mage-VL...", flush=True)
     processor = AutoProcessor.from_pretrained(args.magevl_dir, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.magevl_dir, trust_remote_code=True,
         torch_dtype=torch.bfloat16, device_map="cuda:0",
     ).eval()
 
-    def generate(messages, max_new_tokens=256):
-        text = processor.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True)
-        has_media = any(c.get("type") in ("image", "video")
-                        for m in messages for c in m["content"])
-        kwargs = dict(text=[text], return_tensors="pt", padding=True)
-        if has_media:
-            kwargs["videos"] = [cur_frames]
-        inputs = processor(**kwargs)
-        inputs = {k: (v.to(model.device) if hasattr(v, "to") else v)
-                  for k, v in inputs.items()}
-        if "pixel_values" in inputs:
-            inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
-        with torch.inference_mode():
-            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                                 do_sample=False)
-        return processor.tokenizer.decode(
-            out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
-
-    # === Episodes for this shard ===
     pairs = find_episodes(args.d2e_dir)
     if args.games:
         gf = {g.strip() for g in args.games.split(",")}
@@ -246,7 +206,7 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done_episodes = set()
-    if out_path.exists():  # resume support
+    if out_path.exists():
         with open(out_path) as f:
             for line in f:
                 try:
@@ -254,8 +214,24 @@ def main():
                 except Exception:
                     pass
 
-    import cv2
-    global cur_frames
+    cur_frames: list = []
+
+    def generate_desc(frames):
+        messages = [{"role": "user", "content": [
+            {"type": "video"}, {"type": "text", "text": DESC_PROMPT},
+        ]}]
+        text = processor.apply_chat_template(messages, tokenize=False,
+                                             add_generation_prompt=True)
+        inputs = processor(text=[text], videos=[frames],
+                           return_tensors="pt", padding=True)
+        inputs = {k: (v.to(model.device) if hasattr(v, "to") else v)
+                  for k, v in inputs.items()}
+        if "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
+        with torch.inference_mode():
+            out = model.generate(**inputs, max_new_tokens=180, do_sample=False)
+        return processor.tokenizer.decode(
+            out[0, inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
 
     n_out = 0
     with open(out_path, "a") as fout:
@@ -269,7 +245,7 @@ def main():
                 if len(actions) < seg_ticks * 2:
                     continue
             except Exception as e:
-                print(f"[shard {args.shard}] SKIP {mcap_path.name}: {e}", flush=True)
+                print(f"[describe] SKIP {mcap_path.name}: {e}", flush=True)
                 continue
 
             cache_dir = Path(args.frame_cache) / game / mkv_path.stem
@@ -291,58 +267,13 @@ def main():
                         frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
                 if len(frames) < 8:
                     continue
-                cur_frames = frames
-
                 t0, t1 = st / 60, (st + seg_ticks) / 60
                 facts = actions_to_facts(actions, st, seg_ticks)
-
-                # ---- Stage A: describe ----
                 try:
-                    desc = generate([{"role": "user", "content": [
-                        {"type": "video"},
-                        {"type": "text", "text":
-                         "Describe this gameplay clip factually in 2-3 sentences: "
-                         "game genre/perspective, what the player-character is doing, "
-                         "visible events or UI state, and apparent player intent."},
-                    ]}], max_new_tokens=180)
+                    desc = generate_desc(frames)
                 except Exception as e:
                     print(f"  desc fail @{t0:.1f}s: {e}", flush=True)
                     continue
-
-                # ---- Stage B: rationale (text-only) ----
-                try:
-                    gt_keys_line = next(
-                        (l for l in facts.splitlines() if l.startswith("Keys held")),
-                        "Keys held: none")
-                    prompt = (
-                        "You are analyzing a gameplay clip. You are given:\n"
-                        "(1) A visual description of the clip.\n"
-                        "(2) The player's EXACT recorded keyboard/mouse inputs.\n\n"
-                        f"### Visual description\n{desc}\n\n"
-                        f"### Recorded inputs (ground truth, exact and complete)\n{facts}\n\n"
-                        f"IMPORTANT: The keys listed above are ALL the keys used. "
-                        f"Do NOT mention any key, button, or input that does not "
-                        f"appear in the recorded inputs. If an action you want to "
-                        f"explain (e.g. attacking) has no corresponding input in "
-                        f"the list, treat it as automatic game behavior, not a "
-                        f"player key press.\n\n"
-                        "Based ONLY on the entities and events in the description, "
-                        "answer in this exact format:\n"
-                        "INTENTION: <one short sentence: what the player is trying to achieve>\n"
-                        "RATIONALE: <2-3 sentences explaining why these specific inputs "
-                        "serve that intention. Only reference entities visible in the "
-                        "description and keys present in the recorded inputs. If the "
-                        "inputs seem random or unrelated to the scene, say so instead "
-                        "of inventing a reason.>"
-                    )
-                    rat = generate([{"role": "user", "content": [
-                        {"type": "text", "text": prompt}]}], max_new_tokens=200)
-                except Exception as e:
-                    print(f"  rat fail @{t0:.1f}s: {e}", flush=True)
-                    rat = ""
-
-                ok = entity_overlap_check(desc, rat, facts)
-                key_hall = key_hallucination_check(rat, facts)
                 ep_records.append({
                     "episode_id": mcap_path.stem,
                     "game": game,
@@ -351,22 +282,148 @@ def main():
                     "frame_ref": str(cache_dir),
                     "description": desc,
                     "facts": facts,
-                    "intention": rat.split("RATIONALE:")[0].replace("INTENTION:", "").strip()
-                                  if "INTENTION:" in rat else "",
-                    "rationale": rat.split("RATIONALE:")[-1].strip()
-                                  if "RATIONALE:" in rat else rat,
-                    "entity_overlap_ok": bool(ok),
-                    "key_hallucination": bool(key_hall),
                 })
 
             for r in ep_records:
                 fout.write(json.dumps(r, ensure_ascii=False) + "\n")
             fout.flush()
             n_out += len(ep_records)
-            print(f"[shard {args.shard}] {game}/{mcap_path.stem}: "
-                  f"{len(ep_records)} segments (total {n_out})", flush=True)
+            print(f"[describe] {game}/{mcap_path.stem}: {len(ep_records)} segs "
+                  f"(total {n_out})", flush=True)
 
-    print(f"[shard {args.shard}] DONE: {n_out} segments → {out_path}", flush=True)
+    print(f"[describe] DONE: {n_out} → {out_path}", flush=True)
+
+
+# ---------------------------------------------------------- explain stage
+
+EXPLAIN_SYSTEM = (
+    "You are an expert gamer analyzing recorded gameplay. You receive:\n"
+    "(1) A visual description of observable behavior in a clip.\n"
+    "(2) The player's EXACT recorded keyboard/mouse inputs (ground truth).\n"
+    "Your job: infer WHY the player made these inputs — tactical reasoning, "
+    "game-state response, or UI navigation logic.\n"
+    "Hard rules:\n"
+    "- The listed inputs are ALL the inputs. Never mention a key/click/scroll "
+    "that does not appear in the recorded inputs.\n"
+    "- Behavior with no corresponding input (e.g. auto-attacks) is game "
+    "automatics, not player action.\n"
+    "- Only reference entities/events present in the visual description.\n"
+    "- If inputs look random or you cannot find a coherent reason, say so "
+    "plainly — do not invent one.\n"
+    "Answer in this exact format:\n"
+    "INTENTION: <one sentence: what the player is trying to achieve>\n"
+    "RATIONALE: <2-4 sentences: why these specific inputs accomplish it, "
+    "grounded in the described scene state>"
+)
+
+
+def run_explain(args):
+    """Stage B: strong LLM (API) → intention + rationale. Output: final.jsonl"""
+    from openai import OpenAI
+
+    client = OpenAI(base_url=args.api_base, api_key=args.api_key or "EMPTY")
+
+    in_path = Path(args.describe_output or args.output)
+    out_path = Path(args.output)
+    done = set()
+    if out_path.exists():
+        with open(out_path) as f:
+            for line in f:
+                try:
+                    done.add(json.loads(line)["episode_id"])
+                except Exception:
+                    pass
+
+    records = []
+    with open(in_path) as f:
+        for line in f:
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                pass
+    print(f"[explain] {len(records)} records in, {len(done)} episodes already done",
+          flush=True)
+
+    n_out = 0
+    with open(out_path, "a") as fout:
+        for i, r in enumerate(records):
+            if r["episode_id"] in done:
+                continue
+            prompt = (
+                f"### Visual description (observable behavior)\n{r['description']}\n\n"
+                f"### Recorded inputs (ground truth, exact and complete)\n{r['facts']}"
+            )
+            try:
+                resp = client.chat.completions.create(
+                    model=args.api_model,
+                    messages=[
+                        {"role": "system", "content": EXPLAIN_SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=320, temperature=0.2,
+                )
+                rat = resp.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"  explain fail [{i}] {r['episode_id']}@{r['t_start_s']}s: {e}",
+                      flush=True)
+                continue
+
+            r["intention"] = (rat.split("RATIONALE:")[0]
+                              .replace("INTENTION:", "").strip()
+                              if "INTENTION:" in rat else "")
+            r["rationale"] = (rat.split("RATIONALE:")[-1].strip()
+                              if "RATIONALE:" in rat else rat)
+            r["entity_overlap_ok"] = entity_overlap_check(
+                r["description"], r["rationale"], r["facts"])
+            r["key_hallucination"] = key_hallucination_check(
+                r["rationale"], r["facts"])
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+            n_out += 1
+            if n_out % 50 == 0:
+                fout.flush()
+                print(f"[explain] {n_out} done", flush=True)
+
+    fout.flush()
+    print(f"[explain] DONE: {n_out} → {out_path}", flush=True)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--stage", choices=["describe", "explain", "both"],
+                    default="both",
+                    help="describe=Mage-VL visual; explain=strong LLM API; both=legacy single-model")
+    # data
+    ap.add_argument("--d2e-dir", required=True)
+    ap.add_argument("--magevl-dir", required=True)
+    ap.add_argument("--frame-cache", required=True)
+    ap.add_argument("--games", default=None)
+    ap.add_argument("--segment-frames", type=int, default=32)
+    ap.add_argument("--stride-seconds", type=float, default=60.0)
+    ap.add_argument("--peaks-per-episode", type=int, default=6)
+    ap.add_argument("--max-segments", type=int, default=0)
+    ap.add_argument("--max-episodes", type=int, default=0)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1)
+    # describe stage
+    ap.add_argument("--output", required=True)
+    # explain stage
+    ap.add_argument("--describe-output", default=None,
+                    help="input jsonl from describe stage (default: <output>.describe.jsonl)")
+    ap.add_argument("--api-base", default="http://localhost:8000/v1")
+    ap.add_argument("--api-model", default="Qwen/Qwen3-32B")
+    ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"))
+    args = ap.parse_args()
+
+    if args.stage == "explain" and not args.describe_output:
+        args.describe_output = str(Path(args.output).with_suffix("")) + ".describe.jsonl"
+    if args.stage == "describe" and not args.describe_output:
+        args.describe_output = args.output
+
+    if args.stage in ("describe", "both"):
+        run_describe(args)
+    if args.stage in ("explain", "both"):
+        run_explain(args)
 
 
 if __name__ == "__main__":
