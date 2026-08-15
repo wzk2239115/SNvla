@@ -35,12 +35,12 @@ def setup_ddp():
     import torch
     if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
         import torch.distributed as dist
-        dist.init_process_group("nccl")
-        rank = dist.get_rank()
         local_rank = int(os.environ["LOCAL_RANK"])
-        world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
         device = torch.device("cuda", local_rank)
+        dist.init_process_group("nccl", device_id=device)
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         return rank, local_rank, world_size, device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return 0, 0, 1, device
@@ -48,8 +48,9 @@ def setup_ddp():
 
 def barrier(world_size):
     if world_size > 1:
+        import torch
         import torch.distributed as dist
-        dist.barrier()
+        dist.barrier(device_ids=[torch.cuda.current_device()])
 
 
 def explore_d2e(d2e_dir: Path, max_show: int = 40):

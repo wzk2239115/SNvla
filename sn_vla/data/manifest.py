@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from .align import EpisodeIndex, build_episode_index, episode_index_to_samples, TrainingSample
 from .causality import CausalityReport, ffprobe_codec, ffprobe_fps
+from .align import build_episode_index_cached
 
 
 def find_episodes(root_dir: str | Path) -> list[tuple[Path, Path]]:
@@ -31,6 +32,37 @@ def find_episodes(root_dir: str | Path) -> list[tuple[Path, Path]]:
     return pairs
 
 
+def _index_one(job):
+    """Worker: causality check + index one episode. Returns manifest entry or None."""
+    mcap_path, mkv_path, tick_hz, window_frames, check_causality, skip_b = job
+    try:
+        report = None
+        if check_causality:
+            report = CausalityReport(mkv_path)
+            if not report.is_causal_safe and skip_b:
+                return {"_skip": f"{mkv_path.name}: B-frames"}
+
+        idx = build_episode_index_cached(
+            mcap_path=mcap_path,
+            mkv_path=mkv_path,
+            tick_hz=tick_hz,
+            window_frames=window_frames,
+        )
+        return {
+            "episode_id": idx.episode_id,
+            "mcap_path": str(mcap_path),
+            "mkv_path": str(mkv_path),
+            "game_title": idx.game_title,
+            "duration_ns": int(idx.duration_ns),
+            "fps": float(idx.fps),
+            "n_ticks": idx.n_ticks,
+            "n_samples": idx.n_ticks,
+            "codec": report.codec if report else ffprobe_codec(mkv_path),
+        }
+    except Exception as e:
+        return {"_error": f"{mcap_path.name}: {e}"}
+
+
 def build_manifest(
     root_dir: str | Path,
     output_path: str | Path,
@@ -38,6 +70,7 @@ def build_manifest(
     window_frames: int = 64,
     check_causality: bool = True,
     skip_b_frame_episodes: bool = True,
+    workers: int = 0,
 ) -> dict:
     """Build a manifest JSON from a directory of D2E recordings.
 
@@ -48,7 +81,12 @@ def build_manifest(
         window_frames: visual window size.
         check_causality: if True, probe each episode for B-frames.
         skip_b_frame_episodes: if True (and check_causality), skip non-causal episodes.
+        workers: parallel workers for indexing (0 = auto: min(32, cpu_count)).
     """
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+    from tqdm import tqdm
+
     pairs = find_episodes(root_dir)
     print(f"Found {len(pairs)} episodes in {root_dir}")
 
@@ -60,44 +98,34 @@ def build_manifest(
         "n_samples": 0,
     }
 
-    total_samples = 0
-    for mcap_path, mkv_path in tqdm(pairs, desc="Indexing episodes"):
-        if check_causality:
-            report = CausalityReport(mkv_path)
-            if not report.is_causal_safe:
-                msg = f"  WARNING: {mkv_path.name} has B-frames"
-                if skip_b_frame_episodes:
-                    print(f"{msg} — skipping")
-                    continue
-                print(msg)
+    if workers <= 0:
+        workers = min(32, os.cpu_count() or 8)
 
-        try:
-            idx = build_episode_index(
-                mcap_path=mcap_path,
-                mkv_path=mkv_path,
-                tick_hz=tick_hz,
-                window_frames=window_frames,
-            )
-        except Exception as e:
-            print(f"  ERROR indexing {mcap_path.name}: {e}")
-            continue
+    jobs = [
+        (mcap, mkv, tick_hz, window_frames, check_causality, skip_b_frame_episodes)
+        for mcap, mkv in pairs
+    ]
 
-        ep_entry = {
-            "episode_id": idx.episode_id,
-            "mcap_path": str(mcap_path),
-            "mkv_path": str(mkv_path),
-            "game_title": idx.game_title,
-            "duration_ns": int(idx.duration_ns),
-            "fps": float(idx.fps),
-            "n_ticks": idx.n_ticks,
-            "n_samples": idx.n_ticks,
-            "codec": report.codec if check_causality else ffprobe_codec(mkv_path),
-        }
-        manifest["episodes"].append(ep_entry)
-        total_samples += idx.n_ticks
+    n_skipped = n_errors = 0
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for entry in tqdm(ex.map(_index_one, jobs), total=len(jobs),
+                          desc=f"Indexing ({workers} workers)", unit="ep", smoothing=0.1):
+            if entry is None:
+                continue
+            if "_skip" in entry:
+                n_skipped += 1
+                print(f"  SKIP {entry['_skip']}")
+            elif "_error" in entry:
+                n_errors += 1
+                print(f"  ERROR {entry['_error']}")
+            else:
+                manifest["episodes"].append(entry)
 
+    total_samples = sum(ep["n_samples"] for ep in manifest["episodes"])
     manifest["n_samples"] = total_samples
     manifest["n_episodes"] = len(manifest["episodes"])
+    manifest["n_skipped"] = n_skipped
+    manifest["n_errors"] = n_errors
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
