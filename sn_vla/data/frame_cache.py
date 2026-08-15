@@ -95,13 +95,15 @@ def build_frame_cache(
 
     jobs = [(mkv, cache_root, stride, size, quality) for _, mkv in pairs]
     done = skip = error = 0
+    from tqdm import tqdm
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        for name, status in ex.map(_worker, jobs):
+        for name, status in tqdm(ex.map(_worker, jobs), total=len(jobs),
+                                 desc="Extracting frames", unit="ep", smoothing=0.1):
             if status == "ok":
                 done += 1
             elif status == "error":
                 error += 1
-            print(f"  [{done + skip + error}/{len(jobs)}] {name}: {status}")
+                print(f"  ERROR: {name}")
 
     print(f"Done: {done} extracted, {error} errors. Cache at {cache_root}")
 
