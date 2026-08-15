@@ -129,6 +129,8 @@ class SNVLA(nn.Module):
             brain_dim=config.d_brain, fast_dim=config.d_fast
         ) if config.use_brain else None
 
+        self._visual_frozen = False
+
     def forward(
         self,
         visual: torch.Tensor,            # [B, n_canvas, 3, H, W]
@@ -147,8 +149,11 @@ class SNVLA(nn.Module):
             gate_logits: [B, 2] or None (if gate disabled).
         """
         # 1. Visual encoding → [B, P, d_vision]
-        #    Both SimpleViT and MageViTBackbone accept (canvases, canvas_mask)
-        vis_feat = self.visual(visual, canvas_mask)
+        #    Skip autograd graph through ViT when frozen (big speedup, no
+        #    activation storage for backward we don't need).
+        with torch.set_grad_enabled(not self._visual_frozen):
+            vis_feat = self.visual(visual, canvas_mask)
+        vis_feat = vis_feat.detach() if self._visual_frozen else vis_feat
 
         # Expand canvas_mask [B, N] to patch_mask [B, P] for temporal memory
         patch_mask = None
@@ -181,11 +186,13 @@ class SNVLA(nn.Module):
         """Freeze visual encoder (Phase 1, 2a)."""
         for p in self.visual.parameters():
             p.requires_grad = False
+        self._visual_frozen = True
 
     @torch.no_grad()
     def unfreeze_visual_last_n(self, n: int):
         """Unfreeze last n layers of visual encoder (Phase 2b)."""
         self.freeze_visual()
+        self._visual_frozen = False
         if isinstance(self.visual, SimpleViT):
             for blk in self.visual.blocks[-n:]:
                 for p in blk.parameters():
@@ -198,3 +205,4 @@ class SNVLA(nn.Module):
         """Unfreeze entire visual encoder (Phase 2c)."""
         for p in self.visual.parameters():
             p.requires_grad = True
+        self._visual_frozen = False

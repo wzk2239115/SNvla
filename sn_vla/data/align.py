@@ -17,6 +17,7 @@ Locked spec (plan.md v3 §4):
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -164,6 +165,77 @@ def build_episode_index(
         btn_multi_hot=btn_multi_hot,
         wheel=wheel,
     )
+
+
+def build_episode_index_cached(
+    mcap_path: str | Path,
+    mkv_path: str | Path | None = None,
+    tick_hz: int = 60,
+    window_frames: int = 64,
+    episode_id: str | None = None,
+    cache_dir: str | Path | None = None,
+) -> EpisodeIndex:
+    """build_episode_index with npz caching (parsing mcap is slow; cache is fast).
+
+    Cache key includes game dir + episode stem + tick_hz.
+    Set SNVLA_INDEX_CACHE env var to change default cache location.
+    """
+    import os
+    if cache_dir is None:
+        cache_dir = os.environ.get("SNVLA_INDEX_CACHE", "index_cache")
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    mcap_path = Path(mcap_path)
+    ck = cache_dir / f"{mcap_path.parent.name}__{mcap_path.stem}__thz{tick_hz}.npz"
+
+    if ck.exists():
+        try:
+            with np.load(ck, allow_pickle=False) as z:
+                meta = json.loads(str(z["meta_json"]))
+                return EpisodeIndex(
+                    episode_id=meta["episode_id"],
+                    mcap_path=meta["mcap_path"],
+                    mkv_path=meta["mkv_path"],
+                    game_title=meta["game_title"],
+                    duration_ns=int(meta["duration_ns"]),
+                    fps=float(meta["fps"]),
+                    n_ticks=int(meta["n_ticks"]),
+                    decision_times_ns=z["decision_times_ns"],
+                    visual_end_frame_idx=z["visual_end_frame_idx"],
+                    kbd_multi_hot=z["kbd_multi_hot"],
+                    press_events=z["press_events"],
+                    release_events=z["release_events"],
+                    mouse_dx=z["mouse_dx"],
+                    mouse_dy=z["mouse_dy"],
+                    btn_multi_hot=z["btn_multi_hot"],
+                    wheel=z["wheel"],
+                )
+        except Exception:
+            pass  # corrupted cache → rebuild
+
+    idx = build_episode_index(mcap_path, mkv_path, tick_hz, window_frames, episode_id)
+
+    meta = {
+        "episode_id": idx.episode_id, "mcap_path": idx.mcap_path,
+        "mkv_path": idx.mkv_path, "game_title": idx.game_title,
+        "duration_ns": int(idx.duration_ns), "fps": float(idx.fps),
+        "n_ticks": int(idx.n_ticks), "tick_hz": tick_hz,
+    }
+    np.savez_compressed(
+        ck,
+        meta_json=np.array(json.dumps(meta)),
+        decision_times_ns=idx.decision_times_ns,
+        visual_end_frame_idx=idx.visual_end_frame_idx,
+        kbd_multi_hot=idx.kbd_multi_hot,
+        press_events=idx.press_events,
+        release_events=idx.release_events,
+        mouse_dx=idx.mouse_dx,
+        mouse_dy=idx.mouse_dy,
+        btn_multi_hot=idx.btn_multi_hot,
+        wheel=idx.wheel,
+    )
+    return idx
 
 
 def episode_index_to_samples(

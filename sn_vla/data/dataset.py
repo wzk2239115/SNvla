@@ -55,6 +55,10 @@ class D2EDataset(Dataset):
         self,
         manifest_path: str | Path,
         codec_cache_dir: str | Path | None = None,
+        frame_cache_dir: str | Path | None = None,
+        frame_stride: int = 8,
+        n_visual_frames: int = 8,
+        frame_size: int = 224,
         tick_hz: int = 60,
         window_frames: int = 64,
         clip_frames: int = 64,
@@ -63,10 +67,14 @@ class D2EDataset(Dataset):
         transform=None,
     ):
         from .manifest import load_manifest
-        from .align import build_episode_index
+        from .align import build_episode_index_cached
 
         self.manifest = load_manifest(manifest_path)
         self.codec_cache_dir = Path(codec_cache_dir) if codec_cache_dir else None
+        self.frame_cache_dir = Path(frame_cache_dir) if frame_cache_dir else None
+        self.frame_stride = frame_stride
+        self.n_visual_frames = n_visual_frames
+        self.frame_size = frame_size
         self.tick_hz = tick_hz
         self.window_frames = window_frames
         self.clip_frames = clip_frames
@@ -79,7 +87,7 @@ class D2EDataset(Dataset):
 
         for arr_idx, ep in enumerate(self.manifest["episodes"]):
             try:
-                idx = build_episode_index(
+                idx = build_episode_index_cached(
                     mcap_path=ep["mcap_path"],
                     mkv_path=ep["mkv_path"],
                     tick_hz=tick_hz,
@@ -98,13 +106,37 @@ class D2EDataset(Dataset):
         return len(self._samples)
 
     def _load_clip_visual(self, ep_arr_idx: int, episode_id: str, clip_idx: int, tick: int) -> np.ndarray:
-        """Load visual input for a clip/tick. Returns [n_frames, H, W, 3] uint8.
+        """Load visual input for a tick. Returns [n_frames, H, W, 3] uint8.
 
         Priority:
-          1. Pre-computed codec canvas cache (if codec_cache_dir set)
-          2. On-the-fly frame extraction from mkv (fallback, no codec needed)
+          1. Offline JPEG frame cache (fast random access)
+          2. Pre-computed codec canvas cache (if codec_cache_dir set)
+          3. On-the-fly frame extraction from mkv (slow fallback)
         """
-        # Try codec cache first
+        idx = self._episode_indices[ep_arr_idx]
+        if tick >= idx.n_ticks:
+            return np.zeros((1, self.frame_size, self.frame_size, 3), dtype=np.uint8)
+        end_frame = int(idx.visual_end_frame_idx[tick])
+
+        # 1. JPEG frame cache (preferred)
+        if self.frame_cache_dir is not None:
+            import cv2
+            from pathlib import Path as _P
+            cache_dir = self.frame_cache_dir / _P(idx.mkv_path).parent.name / _P(idx.mkv_path).stem
+            e = end_frame // self.frame_stride
+            start = max(0, e - self.n_visual_frames + 1)
+            frames = []
+            for j in range(start, e + 1):
+                fp = cache_dir / f"f_{j + 1:06d}.jpg"
+                if not fp.exists():
+                    continue
+                img = cv2.imread(str(fp))
+                if img is not None:
+                    frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            if frames:
+                return np.stack(frames)
+
+        # 2. Codec canvas cache
         if self.codec_cache_dir is not None:
             clip_dir = self.codec_cache_dir / episode_id / f"clip_{clip_idx:05d}"
             meta_path = clip_dir / "meta.json"
@@ -123,7 +155,7 @@ class D2EDataset(Dataset):
                 if canvases:
                     return np.stack(canvases)
 
-        # Fallback: on-the-fly frame extraction from mkv
+        # 3. On-the-fly extraction (slow)
         return self._extract_frames_onthefly(ep_arr_idx, tick)
 
     def _extract_frames_onthefly(self, ep_arr_idx: int, tick: int, target_size: int = 224) -> np.ndarray:
