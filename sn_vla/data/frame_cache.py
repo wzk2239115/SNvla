@@ -160,7 +160,8 @@ def _worker(args):
     mkv, cache_root, stride, size, quality, hwaccel, segments, gpu = args
     meta = build_episode_cache(mkv, Path(cache_root), stride, size, quality,
                                hwaccel=hwaccel, segments=segments, gpu=gpu)
-    return mkv.name, meta["status"]
+    hw_tag = f" [gpu{gpu}]" if (hwaccel == "cuda" and gpu is not None) else ""
+    return mkv.name, meta["status"], hw_tag
 
 
 def build_frame_cache(
@@ -204,6 +205,20 @@ def build_frame_cache(
     mode = f"GPU decode ({n_gpus} GPUs)" if hwaccel == "cuda" else "CPU decode"
     print(f"Building frame cache: {len(pairs)} episodes, stride={stride}, size={size}, "
           f"workers={workers}, segments/ep={segments}, {mode}")
+    if hwaccel == "cuda":
+        # Sanity-check: cuvid decoders present?
+        chk = subprocess.run(["ffmpeg", "-hide_banner", "-decoders"],
+                             capture_output=True, text=True)
+        has_cuvid = "h264_cuvid" in chk.stdout
+        if has_cuvid:
+            print(f"[hwaccel] OK: cuvid decoders available, using GPU {0}-{n_gpus-1} "
+                  f"round-robin (episode0→GPU0, episode1→GPU1, ...)")
+            print("[hwaccel] Verify live with: nvidia-smi | grep ffmpeg")
+        else:
+            print("[hwaccel] WARNING: ffmpeg lacks cuvid support, falling back to CPU decode!")
+            hwaccel = None
+    else:
+        print("[hwaccel] CPU decode (pass --hwaccel cuda to use GPU)")
 
     jobs = [
         (mkv, cache_root, stride, size, quality, hwaccel, segments,
@@ -211,17 +226,23 @@ def build_frame_cache(
         for i, (_, mkv) in enumerate(pairs)
     ]
     done = error = 0
+    from collections import Counter
+    gpu_usage = Counter()
     from tqdm import tqdm
     with ProcessPoolExecutor(max_workers=workers) as ex:
-        for name, status in tqdm(ex.map(_worker, jobs), total=len(jobs),
-                                 desc="Extracting frames", unit="ep", smoothing=0.1):
+        for name, status, hw_tag in tqdm(ex.map(_worker, jobs), total=len(jobs),
+                                        desc="Extracting frames", unit="ep", smoothing=0.1):
             if status == "ok":
                 done += 1
+                if hw_tag:
+                    gpu_usage[hw_tag] += 1
             elif status == "error":
                 error += 1
                 print(f"  ERROR: {name}")
 
     print(f"Done: {done} extracted, {error} errors. Cache at {cache_root}")
+    if gpu_usage:
+        print(f"GPU decode usage per episode: {dict(gpu_usage)}")
 
 
 def main():
