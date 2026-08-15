@@ -113,7 +113,7 @@ def select_segments(actions, seg_ticks: int, stride_ticks: int,
     return sorted(set(s for s in starts if 0 <= s < n - seg_ticks))
 
 
-def entity_overlap_check(description: str, rationale: str) -> bool:
+def entity_overlap_check(description: str, rationale: str, facts: str = "") -> bool:
     """Cheap guard: nouns in rationale that appear nowhere in description/facts.
 
     Uses a small stopword list; flags samples with many novel entities.
@@ -122,10 +122,63 @@ def entity_overlap_check(description: str, rationale: str) -> bool:
     stop = {"the", "a", "an", "is", "are", "was", "to", "of", "in", "on",
             "and", "or", "for", "with", "that", "this", "it", "its", "as",
             "be", "by", "at", "from", "he", "she", "they", "player", "game",
-            "enemy", "enemies", "weapon", "gun", "screen", "move", "moving"}
+            "enemy", "enemies", "weapon", "gun", "screen", "move", "moving",
+            "press", "pressing", "presses", "release", "releasing",
+            "holding", "held", "key", "keys", "mouse", "keyboard", "aim",
+            "aiming", "attack", "attacking", "navigate", "navigating",
+            "using", "use", "using", "control", "character", "movement"}
     words = lambda s: set(w for w in re.findall(r"[a-z]{3,}", s.lower()) if w not in stop)
-    novel = words(rationale) - words(description)
+    novel = words(rationale) - words(description) - words(facts)
     return len(novel) <= 4  # allow a few generic verbs/nouns
+
+
+ACTION_VERBS = {
+    "attack": ["j", "k", "l", "space", "left", "mouse"],
+    "health": [], "heal": [], "jump": ["space", "w"],
+    "reload": ["r"], "interact": ["e", "f"], "sprint": ["shift"],
+    "crouch": ["ctrl", "c"], "ability": ["q", "e", "r", "f", "1", "2", "3", "4"],
+    "spell": ["q", "e", "r", "f", "1", "2", "3", "4"],
+    "shoot": ["left"], "fire": ["left"], "aim": ["right"],
+}
+
+
+def key_hallucination_check(rationale: str, facts: str) -> bool:
+    """Detect fabricated input actions in rationale.
+
+    Two patterns:
+    1. Named keys not in ground truth (mentions 'R key' but no R in facts).
+    2. Action-verb + 'key' phrasing ('pressing the attack key') where the
+       facts contain none of the keys commonly bound to that action AND the
+       game inputs are pure movement (WASD-only) — a strong hallucination sign.
+    """
+    import re
+    rl = rationale.lower()
+
+    # --- Pattern 1: named single-letter/space keys absent from facts ---
+    gt_keys = set()
+    for m in re.finditer(r"\b([A-Z]{1,10})\(", facts):
+        gt_keys.add(m.group(1).lower())
+    for m in re.finditer(r"Presses: ([^\n]+)", facts):
+        gt_keys.update(k.strip().lower() for k in m.group(1).split(",") if k.strip())
+    for m in re.finditer(r"Releases: ([^\n]+)", facts):
+        gt_keys.update(k.strip().lower() for k in m.group(1).split(",") if k.strip())
+    if "space" in rl and "space" not in gt_keys and "space" in facts.lower() is False:
+        pass  # 'space' as word is ambiguous; handled by pattern 2
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ".lower():
+        if re.search(rf"\b{letter}\s+key\b", rl) and letter not in gt_keys:
+            return True
+
+    # --- Pattern 2: '<action> key' with no plausible binding in facts ---
+    facts_lower = facts.lower()
+    clicks_present = "buttons held" in facts_lower and "buttons held 0" not in facts_lower
+    for verb, bindings in ACTION_VERBS.items():
+        if re.search(rf"\b{verb}\s+key", rl) or re.search(rf"\b{verb}\s+button", rl):
+            has_binding = any(b in gt_keys for b in bindings)
+            if verb in ("shoot", "fire", "aim") and clicks_present:
+                has_binding = True
+            if not has_binding:
+                return True
+    return False
 
 
 def main():
@@ -258,19 +311,29 @@ def main():
 
                 # ---- Stage B: rationale (text-only) ----
                 try:
+                    gt_keys_line = next(
+                        (l for l in facts.splitlines() if l.startswith("Keys held")),
+                        "Keys held: none")
                     prompt = (
                         "You are analyzing a gameplay clip. You are given:\n"
                         "(1) A visual description of the clip.\n"
                         "(2) The player's EXACT recorded keyboard/mouse inputs.\n\n"
                         f"### Visual description\n{desc}\n\n"
-                        f"### Recorded inputs (ground truth, exact)\n{facts}\n\n"
+                        f"### Recorded inputs (ground truth, exact and complete)\n{facts}\n\n"
+                        f"IMPORTANT: The keys listed above are ALL the keys used. "
+                        f"Do NOT mention any key, button, or input that does not "
+                        f"appear in the recorded inputs. If an action you want to "
+                        f"explain (e.g. attacking) has no corresponding input in "
+                        f"the list, treat it as automatic game behavior, not a "
+                        f"player key press.\n\n"
                         "Based ONLY on the entities and events in the description, "
                         "answer in this exact format:\n"
                         "INTENTION: <one short sentence: what the player is trying to achieve>\n"
                         "RATIONALE: <2-3 sentences explaining why these specific inputs "
                         "serve that intention. Only reference entities visible in the "
-                        "description. If the inputs seem random or unrelated to the scene, "
-                        "say so instead of inventing a reason.>"
+                        "description and keys present in the recorded inputs. If the "
+                        "inputs seem random or unrelated to the scene, say so instead "
+                        "of inventing a reason.>"
                     )
                     rat = generate([{"role": "user", "content": [
                         {"type": "text", "text": prompt}]}], max_new_tokens=200)
@@ -278,7 +341,8 @@ def main():
                     print(f"  rat fail @{t0:.1f}s: {e}", flush=True)
                     rat = ""
 
-                ok = entity_overlap_check(desc, rat)
+                ok = entity_overlap_check(desc, rat, facts)
+                key_hall = key_hallucination_check(rat, facts)
                 ep_records.append({
                     "episode_id": mcap_path.stem,
                     "game": game,
@@ -292,6 +356,7 @@ def main():
                     "rationale": rat.split("RATIONALE:")[-1].strip()
                                   if "RATIONALE:" in rat else rat,
                     "entity_overlap_ok": bool(ok),
+                    "key_hallucination": bool(key_hall),
                 })
 
             for r in ep_records:
