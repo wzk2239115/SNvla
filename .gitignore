@@ -24,3 +24,4 @@ checkpoints/
 *.json.bak
 CVE-2017-9047_利用技术指导.md
 index_cache/
+tmp/
