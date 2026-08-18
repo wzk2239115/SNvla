@@ -217,9 +217,35 @@ def run_phase1(args):
     if is_main:
         print(f"\n{'='*60}\nTraining: {args.epochs} epochs\n{'='*60}\n")
 
-    import time
+    # === Resume support ===
+    start_epoch = 0
     global_step = 0
-    for epoch in range(args.epochs):
+    resume_path = output_dir / "checkpoint_resume.pt"
+    if args.resume and resume_path.exists():
+        ck = torch.load(resume_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ck["model"])
+        optimizer.load_state_dict(ck["optimizer"])
+        scheduler.load_state_dict(ck["scheduler"])
+        start_epoch = ck["epoch"] + 1
+        global_step = ck["global_step"]
+        if is_main:
+            print(f"Resumed from {resume_path}: epoch {ck['epoch']} "
+                  f"(continuing at epoch {start_epoch}, step {global_step})")
+        del ck
+    elif args.resume:
+        # fall back to any epoch checkpoint (model only)
+        eps = sorted(output_dir.glob("checkpoint_ep*.pt"),
+                     key=lambda p: int(p.stem.split("ep")[1]))
+        if eps:
+            ck = torch.load(eps[-1], map_location="cpu", weights_only=False)
+            model.load_state_dict(ck["model"])
+            start_epoch = int(eps[-1].stem.split("ep")[1]) + 1
+            if is_main:
+                print(f"Resumed model from {eps[-1]} (continuing at epoch {start_epoch})")
+            del ck
+
+    import time
+    for epoch in range(start_epoch, args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
         model.train()
@@ -266,6 +292,15 @@ def run_phase1(args):
             epoch_losses.append(losses["total"].item())
             global_step += 1
 
+            # Periodic resumable checkpoint (every save_every steps, rank 0)
+            if is_main and global_step % args.save_every == 0:
+                torch.save({
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "global_step": global_step,
+                }, resume_path)
             if is_main and global_step % args.log_every == 0:
                 with torch.no_grad():
                     kbd_acc = ((torch.sigmoid(action.kbd) > 0.5).float()
@@ -315,6 +350,10 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--num-workers", type=int, default=8, help="per GPU")
     ap.add_argument("--log-every", type=int, default=50)
+    ap.add_argument("--save-every", type=int, default=2000,
+                    help="steps between resumable checkpoints")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from checkpoint_resume.pt or latest checkpoint_epN.pt")
     ap.add_argument("--skip-causality", action="store_true")
     args = ap.parse_args()
     run_phase1(args)

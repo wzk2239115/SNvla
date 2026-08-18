@@ -213,6 +213,40 @@ class D2EDataset(Dataset):
         )
 
     def __getitem__(self, i: int) -> dict:
+        try:
+            return self._get_item_impl(i)
+        except Exception:
+            # Robustness: a corrupted sample must not kill the DataLoader worker.
+            # Return a zero/no-op sample (kept rare; underlying issue is logged once).
+            import traceback
+            if not getattr(self, "_logged_getitem_error", False):
+                self._logged_getitem_error = True
+                print(f"[D2EDataset] getitem error (logging once):\n"
+                      f"{traceback.format_exc()[-800:]}")
+            return self._zero_sample()
+
+    def _zero_sample(self) -> dict:
+        z = lambda *shape: torch.zeros(*shape)
+        mid = self.bucketer.n_buckets // 2
+        return {
+            "visual": z(1, 3, self.frame_size, self.frame_size),
+            "target_kbd": z(N_VK),
+            "target_press": z(N_VK),
+            "target_release": z(N_VK),
+            "target_mdx_bucket": torch.tensor(mid, dtype=torch.long),
+            "target_mdx_residual": torch.tensor(0.0),
+            "target_mdy_bucket": torch.tensor(mid, dtype=torch.long),
+            "target_mdy_residual": torch.tensor(0.0),
+            "target_btn": z(N_MOUSE_BUTTONS),
+            "target_wheel": torch.tensor(0, dtype=torch.long),
+            "prev_kbd": z(N_VK),
+            "prev_mdx_bucket": torch.tensor(mid, dtype=torch.long),
+            "prev_mdy_bucket": torch.tensor(mid, dtype=torch.long),
+            "prev_btn": z(N_MOUSE_BUTTONS),
+            "prev_wheel": torch.tensor(0, dtype=torch.long),
+        }
+
+    def _get_item_impl(self, i: int) -> dict:
         ep_arr_idx, tick, clip_idx = self._samples[i]
         idx = self._episode_indices[ep_arr_idx]
         episode_id = idx.episode_id
