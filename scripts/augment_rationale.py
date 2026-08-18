@@ -44,6 +44,13 @@ VK_NAMES = {
     0x45: "E", 0x51: "Q", 0x52: "R", 0x46: "F", 0x43: "C", 0x56: "V",
     0x31: "1", 0x32: "2", 0x33: "3", 0x34: "4", 0x35: "5",
     0x26: "UP", 0x28: "DOWN", 0x25: "LEFT", 0x27: "RIGHT",
+    # modifiers (frequent in FPS: sprint/crouch/walk)
+    0xA0: "LSHIFT", 0xA1: "RSHIFT", 0xA2: "LCTRL", 0xA3: "RCTRL",
+    0xA4: "LALT", 0xA5: "RALT",
+    0x70: "F1", 0x71: "F2", 0x72: "F3", 0x73: "F4", 0x74: "F5", 0x75: "F6",
+    0x76: "F7", 0x77: "F8", 0x78: "F9", 0x79: "F10", 0x7A: "F11", 0x7B: "F12",
+    0x4D: "M", 0x50: "P", 0x47: "G", 0x58: "X", 0x5A: "Z", 0x42: "B", 0x4E: "N",
+    0x36: "6", 0x37: "7", 0x38: "8", 0x39: "9", 0x30: "0",
 }
 
 
@@ -178,6 +185,30 @@ DESC_PROMPT = (
 )
 
 
+def truncate_repetition(text: str, max_repeat: int = 2) -> str:
+    """Cut degenerate repetition loops ('then moves forward again... again...').
+
+    Splits into sentences; when a sentence repeats, keeps at most `max_repeat`
+    occurrences and truncates there. Returns cleaned text.
+    """
+    import re
+    # normalize whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    # split on sentence boundary followed by capital (crude but effective)
+    sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", text)
+    if len(sentences) < 4:
+        return text
+    seen: dict[str, int] = {}
+    out = []
+    for s in sentences:
+        key = re.sub(r"\W+", "", s.lower())[:80]  # fuzzy sentence key
+        seen[key] = seen.get(key, 0) + 1
+        if seen[key] > max_repeat:
+            break
+        out.append(s)
+    return " ".join(out).strip()
+
+
 def run_describe(args):
     """Stage A: Mage-VL → operational descriptions. Output: describe.jsonl"""
     import torch
@@ -270,7 +301,7 @@ def run_describe(args):
                 t0, t1 = st / 60, (st + seg_ticks) / 60
                 facts = actions_to_facts(actions, st, seg_ticks)
                 try:
-                    desc = generate_desc(frames)
+                    desc = truncate_repetition(generate_desc(frames))
                 except Exception as e:
                     print(f"  desc fail @{t0:.1f}s: {e}", flush=True)
                     continue
@@ -308,10 +339,16 @@ EXPLAIN_SYSTEM = (
     "- Behavior with no corresponding input (e.g. auto-attacks) is game "
     "automatics, not player action.\n"
     "- Only reference entities/events present in the visual description.\n"
+    "- If the description CONTRADICTS the inputs (e.g. described movement but "
+    "no keys pressed, or described stillness but W held + large mouse deltas), "
+    "start RATIONALE with exactly 'INCONSISTENT:' followed by one short note "
+    "(likely spectator/replay/cutscene, death cam, menu overlay, or sampling "
+    "miss). Do NOT force an explanation.\n"
     "- If inputs look random or you cannot find a coherent reason, say so "
     "plainly — do not invent one.\n"
     "Answer in this exact format:\n"
-    "INTENTION: <one sentence: what the player is trying to achieve>\n"
+    "INTENTION: <one sentence: what the player is trying to achieve; "
+    "'unclear' if inconsistent>\n"
     "RATIONALE: <2-4 sentences: why these specific inputs accomplish it, "
     "grounded in the described scene state>"
 )
