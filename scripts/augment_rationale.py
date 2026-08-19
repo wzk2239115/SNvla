@@ -354,6 +354,40 @@ EXPLAIN_SYSTEM = (
 )
 
 
+def _parse_explain(raw: str) -> tuple[str, str, str]:
+    """Split a thinking-model response into (thinking, intention, rationale).
+
+    Keeps the chain-of-thought (valuable: contradiction analysis, key
+    reasoning) as its own field; markers are taken from the LAST occurrence
+    (the final answer after thinking), so checks run on the conclusion only.
+    """
+    import re as _re
+    text = raw.strip()
+
+    # extract <think> block if present
+    m = _re.search(r"<think>(.*?)</think>", text, flags=_re.DOTALL)
+    thinking = m.group(1).strip() if m else ""
+    if m:
+        text = (text[: m.start()] + text[m.end():]).strip()
+
+    def grab(marker, s):
+        idx = s.rfind(marker)
+        if idx == -1:
+            return ""
+        rest = s[idx + len(marker):]
+        nxt = _re.search(r"\b(INTENTION|RATIONALE)\s*:", rest)
+        return (rest[: nxt.start()] if nxt else rest).strip()
+
+    intention = grab("INTENTION:", text)
+    rationale = grab("RATIONALE:", text)
+    # free-form CoT before the final markers also counts as thinking
+    if intention:
+        pre = text[: text.rfind("INTENTION:")]
+        if len(pre.strip()) > 40:
+            thinking = (thinking + "\n" + pre.strip()).strip()
+    return thinking, intention, rationale
+
+
 def run_explain(args):
     """Stage B: strong LLM (API) → intention + rationale. Output: final.jsonl"""
     from openai import OpenAI
@@ -397,23 +431,25 @@ def run_explain(args):
                         {"role": "system", "content": EXPLAIN_SYSTEM},
                         {"role": "user", "content": prompt},
                     ],
-                    max_tokens=320, temperature=0.2,
+                    max_tokens=args.max_tokens, temperature=0.2,
+                    timeout=120,
                 )
                 rat = resp.choices[0].message.content.strip()
+                truncated = (getattr(resp.choices[0], "finish_reason", "") == "length")
             except Exception as e:
                 print(f"  explain fail [{i}] {r['episode_id']}@{r['t_start_s']}s: {e}",
                       flush=True)
                 continue
 
-            r["intention"] = (rat.split("RATIONALE:")[0]
-                              .replace("INTENTION:", "").strip()
-                              if "INTENTION:" in rat else "")
-            r["rationale"] = (rat.split("RATIONALE:")[-1].strip()
-                              if "RATIONALE:" in rat else rat)
+            thinking, intention, rationale = _parse_explain(rat)
+            r["thinking"] = thinking
+            r["intention"] = intention
+            r["rationale"] = rationale
+            r["response_truncated"] = truncated
             r["entity_overlap_ok"] = entity_overlap_check(
-                r["description"], r["rationale"], r["facts"])
+                r["description"], rationale, r["facts"])
             r["key_hallucination"] = key_hallucination_check(
-                r["rationale"], r["facts"])
+                rationale, r["facts"])
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
             n_out += 1
             if n_out % 50 == 0:
@@ -448,6 +484,8 @@ def main():
     ap.add_argument("--describe-output", default=None,
                     help="input jsonl from describe stage (default: <output>.describe.jsonl)")
     ap.add_argument("--api-base", default="http://localhost:8000/v1")
+    ap.add_argument("--max-tokens", type=int, default=1024,
+                    help="thinking models need headroom; markers parsed from final answer")
     ap.add_argument("--api-model", default="Qwen/Qwen3-32B")
     ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"))
     args = ap.parse_args()
