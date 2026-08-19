@@ -420,7 +420,7 @@ def run_explain(args):
                 fout.flush()
                 print(f"[explain] {n_out} done", flush=True)
 
-    fout.flush()
+        fout.flush()
     print(f"[explain] DONE: {n_out} → {out_path}", flush=True)
 
 
