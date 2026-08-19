@@ -424,16 +424,19 @@ def run_explain(args):
                 f"### Visual description (observable behavior)\n{r['description']}\n\n"
                 f"### Recorded inputs (ground truth, exact and complete)\n{r['facts']}"
             )
+            req_kwargs = dict(
+                model=args.api_model,
+                messages=[
+                    {"role": "system", "content": EXPLAIN_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                timeout=600,
+            )
+            if args.max_tokens > 0:
+                req_kwargs["max_tokens"] = args.max_tokens
             try:
-                resp = client.chat.completions.create(
-                    model=args.api_model,
-                    messages=[
-                        {"role": "system", "content": EXPLAIN_SYSTEM},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=args.max_tokens, temperature=0.2,
-                    timeout=120,
-                )
+                resp = client.chat.completions.create(**req_kwargs)
                 rat = resp.choices[0].message.content.strip()
                 truncated = (getattr(resp.choices[0], "finish_reason", "") == "length")
             except Exception as e:
@@ -484,8 +487,9 @@ def main():
     ap.add_argument("--describe-output", default=None,
                     help="input jsonl from describe stage (default: <output>.describe.jsonl)")
     ap.add_argument("--api-base", default="http://localhost:8000/v1")
-    ap.add_argument("--max-tokens", type=int, default=1024,
-                    help="thinking models need headroom; markers parsed from final answer")
+    ap.add_argument("--max-tokens", type=int, default=-1,
+                    help="-1 = no token limit (vLLM serves up to context length); "
+                         "thinking models need headroom")
     ap.add_argument("--api-model", default="Qwen/Qwen3-32B")
     ap.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", "EMPTY"))
     args = ap.parse_args()
