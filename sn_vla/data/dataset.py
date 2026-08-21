@@ -56,6 +56,7 @@ class D2EDataset(Dataset):
         manifest_path: str | Path,
         codec_cache_dir: str | Path | None = None,
         frame_cache_dir: str | Path | None = None,
+        packed_frames_dir: str | Path | None = None,
         frame_stride: int = 8,
         n_visual_frames: int = 8,
         frame_size: int = 224,
@@ -72,6 +73,7 @@ class D2EDataset(Dataset):
         self.manifest = load_manifest(manifest_path)
         self.codec_cache_dir = Path(codec_cache_dir) if codec_cache_dir else None
         self.frame_cache_dir = Path(frame_cache_dir) if frame_cache_dir else None
+        self.packed_frames_dir = Path(packed_frames_dir) if packed_frames_dir else None
         self.frame_stride = frame_stride
         self.n_visual_frames = n_visual_frames
         self.frame_size = frame_size
@@ -80,6 +82,10 @@ class D2EDataset(Dataset):
         self.clip_frames = clip_frames
         self.bucketer = bucketer or MouseBucketer()
         self.transform = transform
+
+        # Packed-frame memmaps: {episode_key: np.memmap [n_frames, S, S, 3]}
+        # Opened lazily in each worker process (memmap = zero-copy, page cache).
+        self._memmaps: dict[str, np.memmap] = {}
 
         # Build flat sample index: (episode_idx, tick_idx, clip_idx)
         self._episode_indices: list = []
@@ -105,20 +111,50 @@ class D2EDataset(Dataset):
     def __len__(self) -> int:
         return len(self._samples)
 
+    def _get_memmap(self, mkv_path: str) -> np.memmap | None:
+        """Lazily open (and cache) the packed-frame memmap for an episode."""
+        if self.packed_frames_dir is None:
+            return None
+        from pathlib import Path as _P
+        key = mkv_path
+        mm = self._memmaps.get(key)
+        if mm is not None:
+            return mm
+        p = _P(mkv_path)
+        npy = self.packed_frames_dir / p.parent.name / f"{p.stem}.npy"
+        if not npy.exists():
+            return None
+        try:
+            mm = np.load(str(npy), mmap_mode="r")
+            self._memmaps[key] = mm
+            return mm
+        except Exception:
+            return None
+
     def _load_clip_visual(self, ep_arr_idx: int, episode_id: str, clip_idx: int, tick: int) -> np.ndarray:
         """Load visual input for a tick. Returns [n_frames, H, W, 3] uint8.
 
         Priority:
-          1. Offline JPEG frame cache (fast random access)
-          2. Pre-computed codec canvas cache (if codec_cache_dir set)
-          3. On-the-fly frame extraction from mkv (slow fallback)
+          1. Packed .npy memmap (zero-copy, fastest)
+          2. Offline JPEG frame cache
+          3. Pre-computed codec canvas cache
+          4. On-the-fly frame extraction from mkv (slow fallback)
         """
         idx = self._episode_indices[ep_arr_idx]
         if tick >= idx.n_ticks:
             return np.zeros((1, self.frame_size, self.frame_size, 3), dtype=np.uint8)
         end_frame = int(idx.visual_end_frame_idx[tick])
 
-        # 1. JPEG frame cache (preferred)
+        # 1. Packed memmap
+        mm = self._get_memmap(idx.mkv_path)
+        if mm is not None:
+            e = end_frame // self.frame_stride
+            start = max(0, e - self.n_visual_frames + 1)
+            end2 = min(e + 1, mm.shape[0])
+            if end2 > start:
+                return np.array(mm[start:end2])  # writable copy from page cache
+
+        # 2. JPEG frame cache
         if self.frame_cache_dir is not None:
             import cv2
             from pathlib import Path as _P
@@ -136,7 +172,7 @@ class D2EDataset(Dataset):
             if frames:
                 return np.stack(frames)
 
-        # 2. Codec canvas cache
+        # 3. Codec canvas cache
         if self.codec_cache_dir is not None:
             clip_dir = self.codec_cache_dir / episode_id / f"clip_{clip_idx:05d}"
             meta_path = clip_dir / "meta.json"
@@ -155,7 +191,7 @@ class D2EDataset(Dataset):
                 if canvases:
                     return np.stack(canvases)
 
-        # 3. On-the-fly extraction (slow)
+        # 4. On-the-fly extraction (slow)
         return self._extract_frames_onthefly(ep_arr_idx, tick)
 
     def _extract_frames_onthefly(self, ep_arr_idx: int, tick: int, target_size: int = 224) -> np.ndarray:

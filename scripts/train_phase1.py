@@ -141,6 +141,7 @@ def run_phase1(args):
     dataset = D2EDataset(
         manifest_path=manifest_path,
         frame_cache_dir=args.frame_cache,
+        packed_frames_dir=args.packed_frames,
         tick_hz=args.tick_hz,
         window_frames=args.window_frames,
         clip_frames=args.window_frames,
@@ -339,7 +340,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--d2e-dir", required=True)
     ap.add_argument("--magevl-dir", required=True)
-    ap.add_argument("--frame-cache", default=None, help="JPEG frame cache dir (strongly recommended)")
+    ap.add_argument("--frame-cache", default=None, help="JPEG frame cache dir (fallback)")
+    ap.add_argument("--packed-frames", default=None,
+                    help="Packed .npy frames dir (fastest; see scripts/pack_frames.py)")
     ap.add_argument("--output-dir", default="checkpoints/phase1")
     ap.add_argument("--games", default=None)
     ap.add_argument("--tick-hz", type=int, default=60)
