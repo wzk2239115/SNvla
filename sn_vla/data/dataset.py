@@ -272,19 +272,19 @@ class D2EDataset(Dataset):
 
         return {
             "visual": torch.from_numpy(visual).permute(0, 3, 1, 2).float() / 255.0,  # [n_canvas, 3, H, W]
-            "target_kbd": torch.from_numpy(target.kbd_multi_hot),
-            "target_press": torch.from_numpy(target.press_events),
-            "target_release": torch.from_numpy(target.release_events),
+            "target_kbd": torch.from_numpy(np.asarray(target.kbd_multi_hot, dtype=np.float32)),
+            "target_press": torch.from_numpy(np.asarray(target.press_events, dtype=np.float32)),
+            "target_release": torch.from_numpy(np.asarray(target.release_events, dtype=np.float32)),
             "target_mdx_bucket": torch.tensor(target.mdx_bucket, dtype=torch.long),
             "target_mdx_residual": torch.tensor(target.mdx_residual, dtype=torch.float32),
             "target_mdy_bucket": torch.tensor(target.mdy_bucket, dtype=torch.long),
             "target_mdy_residual": torch.tensor(target.mdy_residual, dtype=torch.float32),
-            "target_btn": torch.from_numpy(target.btn_multi_hot),
+            "target_btn": torch.from_numpy(np.asarray(target.btn_multi_hot, dtype=np.float32)),
             "target_wheel": torch.tensor(target.wheel, dtype=torch.long),
-            "prev_kbd": torch.from_numpy(prev_target.kbd_multi_hot),
+            "prev_kbd": torch.from_numpy(np.asarray(prev_target.kbd_multi_hot, dtype=np.float32)),
             "prev_mdx_bucket": torch.tensor(prev_target.mdx_bucket, dtype=torch.long),
             "prev_mdy_bucket": torch.tensor(prev_target.mdy_bucket, dtype=torch.long),
-            "prev_btn": torch.from_numpy(prev_target.btn_multi_hot),
+            "prev_btn": torch.from_numpy(np.asarray(prev_target.btn_multi_hot, dtype=np.float32)),
             "prev_wheel": torch.tensor(prev_target.wheel, dtype=torch.long),
         }
 

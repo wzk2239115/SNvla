@@ -253,6 +253,7 @@ def run_phase1(args):
         epoch_losses = []
 
         for batch in loader:
+            batch_t0 = time.time()
             for k in batch:
                 batch[k] = batch[k].to(device, non_blocking=True)
 
@@ -305,10 +306,12 @@ def run_phase1(args):
                 with torch.no_grad():
                     kbd_acc = ((torch.sigmoid(action.kbd) > 0.5).float()
                                == batch["target_kbd"]).float().mean().item()
-                eps = args.batch_size * world_size / max(time.time() - t0, 1e-6)
+                # instantaneous rate over the last log interval (not epoch avg)
+                inst = args.batch_size * world_size / max(time.time() - batch_t0, 1e-6)
                 print(f"  [ep{epoch} step{global_step:>6}] loss={losses['total']:.4f} "
                       f"kbd={losses['kbd']:.4f} mouse={losses['mouse']:.4f} "
-                      f"kbd_acc={kbd_acc:.3f} {eps:.0f} samples/s lr={scheduler.get_last_lr()[0]:.2e}")
+                      f"kbd_acc={kbd_acc:.3f} {inst:.0f} samples/s lr={scheduler.get_last_lr()[0]:.2e}",
+                      flush=True)
 
         barrier(world_size)
         if is_main:
@@ -348,7 +351,10 @@ def main():
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--weight-decay", type=float, default=0.01)
-    ap.add_argument("--num-workers", type=int, default=8, help="per GPU")
+    ap.add_argument("--num-workers", type=int, default=4,
+                    help="DataLoader workers PER RANK. Total processes = "
+                         "workers*nproc. Keep modest: each worker holds the "
+                         "dataset index (~31GB uint8 shared via fork COW)")
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-every", type=int, default=2000,
                     help="steps between resumable checkpoints")

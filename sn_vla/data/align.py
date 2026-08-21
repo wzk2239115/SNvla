@@ -193,6 +193,12 @@ def build_episode_index_cached(
         try:
             with np.load(ck, allow_pickle=False) as z:
                 meta = json.loads(str(z["meta_json"]))
+                # Memory diet: dense 0/1 arrays → uint8 (4x smaller than f32).
+                # With ~40M ticks total across episodes this is the difference
+                # between ~123GB and ~31GB resident — the DDP OOM killer fix.
+                kbd = np.asarray(z["kbd_multi_hot"], dtype=np.uint8)
+                press = np.asarray(z["press_events"], dtype=np.uint8)
+                release = np.asarray(z["release_events"], dtype=np.uint8)
                 return EpisodeIndex(
                     episode_id=meta["episode_id"],
                     mcap_path=meta["mcap_path"],
@@ -203,12 +209,12 @@ def build_episode_index_cached(
                     n_ticks=int(meta["n_ticks"]),
                     decision_times_ns=z["decision_times_ns"],
                     visual_end_frame_idx=z["visual_end_frame_idx"],
-                    kbd_multi_hot=z["kbd_multi_hot"],
-                    press_events=z["press_events"],
-                    release_events=z["release_events"],
+                    kbd_multi_hot=kbd,
+                    press_events=press,
+                    release_events=release,
                     mouse_dx=z["mouse_dx"],
                     mouse_dy=z["mouse_dy"],
-                    btn_multi_hot=z["btn_multi_hot"],
+                    btn_multi_hot=np.asarray(z["btn_multi_hot"], dtype=np.uint8),
                     wheel=z["wheel"],
                 )
         except Exception:
@@ -227,12 +233,12 @@ def build_episode_index_cached(
         meta_json=np.array(json.dumps(meta)),
         decision_times_ns=idx.decision_times_ns,
         visual_end_frame_idx=idx.visual_end_frame_idx,
-        kbd_multi_hot=idx.kbd_multi_hot,
-        press_events=idx.press_events,
-        release_events=idx.release_events,
+        kbd_multi_hot=np.asarray(idx.kbd_multi_hot, dtype=np.uint8),
+        press_events=np.asarray(idx.press_events, dtype=np.uint8),
+        release_events=np.asarray(idx.release_events, dtype=np.uint8),
         mouse_dx=idx.mouse_dx,
         mouse_dy=idx.mouse_dy,
-        btn_multi_hot=idx.btn_multi_hot,
+        btn_multi_hot=np.asarray(idx.btn_multi_hot, dtype=np.uint8),
         wheel=idx.wheel,
     )
     return idx
