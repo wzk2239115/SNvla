@@ -154,7 +154,7 @@ class D2EDataset(Dataset):
             if end2 > start:
                 return np.array(mm[start:end2])  # writable copy from page cache
 
-        # 2. JPEG frame cache
+        # 2. JPEG frame cache (resized to frame_size if needed)
         if self.frame_cache_dir is not None:
             import cv2
             from pathlib import Path as _P
@@ -168,7 +168,10 @@ class D2EDataset(Dataset):
                     continue
                 img = cv2.imread(str(fp))
                 if img is not None:
-                    frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    if img.shape[0] != self.frame_size:
+                        img = cv2.resize(img, (self.frame_size, self.frame_size))
+                    frames.append(img)
             if frames:
                 return np.stack(frames)
 
@@ -290,6 +293,15 @@ class D2EDataset(Dataset):
         visual = self._load_clip_visual(ep_arr_idx, episode_id, clip_idx, tick)
         if self.transform:
             visual = self.transform(visual)
+        # Normalize resolution across sources (memmap 128 / JPEG fallback 224)
+        if visual.shape[-1] != self.frame_size:
+            import cv2
+            visual = np.stack([
+                cv2.resize(f, (self.frame_size, self.frame_size)) for f in visual
+            ])
+        # Normalize frame count
+        if visual.shape[0] > self.n_visual_frames:
+            visual = visual[-self.n_visual_frames:]
 
         target = self._get_target(ep_arr_idx, tick)
         prev_target = self._get_target(ep_arr_idx, max(0, tick - 1)) if tick > 0 else None
