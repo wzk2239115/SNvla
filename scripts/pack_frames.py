@@ -40,6 +40,8 @@ def pack_episode(job):
                 img = np.zeros((size, size, 3), dtype=np.uint8)
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                if img.shape[0] != size or img.shape[1] != size:
+                    img = cv2.resize(img, (size, size))
             arr[i] = img
         np.save(out_path, arr)
         (out_path.parent / (out_path.name + ".done")).write_text(
